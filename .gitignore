@@ -1,0 +1,6 @@
+node_modules/
+traces/
+.env
+*.patch
+.cursor
+CLAUDE.md
