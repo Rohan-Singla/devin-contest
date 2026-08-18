@@ -4,3 +4,7 @@ traces/
 *.patch
 .cursor
 CLAUDE.md
+data/
+.DS_Store
+.next/
+next-env.d.ts
