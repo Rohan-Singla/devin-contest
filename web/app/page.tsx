@@ -41,7 +41,11 @@ export default function Page() {
 
   const load = useCallback(async (id: string) => {
     const data = await api.getProject(id)
-    setProject(data.project)
+    // A stored URL whose sandbox is gone would render a dead iframe.
+    setProject({
+      ...data.project,
+      previewUrl: data.project.previewLive ? data.project.previewUrl : null,
+    })
     setIssues(data.issues)
     setPanels({})
     setLogs(
@@ -70,6 +74,10 @@ export default function Page() {
 
       case 'preview_ready':
         setProject((prev) => (prev ? { ...prev, previewUrl: payload.url } : prev))
+        return
+
+      case 'preview_failed':
+        setError(`preview failed: ${payload?.error ?? 'unknown error'}`)
         return
 
       case 'issue_status': {
@@ -245,7 +253,14 @@ export default function Page() {
             <ActivityLog logs={logs} />
           </main>
 
-          <PreviewPane url={project.previewUrl} status={project.status} />
+          <PreviewPane
+            url={project.previewUrl}
+            status={project.status}
+            onRestart={async () => {
+              setError(null)
+              await api.restartPreview(project.id)
+            }}
+          />
         </div>
       )}
     </div>

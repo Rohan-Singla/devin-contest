@@ -11,6 +11,7 @@ import {
   createIssue,
   getProject,
   listIssues,
+  listProjects,
   updateIssue,
   updateProject,
   type Issue,
@@ -24,11 +25,121 @@ import { runWorker } from './worker'
 const TEMPLATE = 'templates/base'
 const MAX_PARALLEL_AGENTS = 3
 
+/**
+ * Agent slots.
+ *
+ * A slot is both a concurrency permit and the identity an agent reports to the
+ * UI ("agent 2"). Every path that runs an issue — planned waves and ad-hoc
+ * issues alike — takes a slot from here, so the cap holds globally and no two
+ * concurrent agents ever claim the same panel.
+ */
+export class SlotPool {
+  private readonly free: number[]
+  private readonly waiting: ((slot: number) => void)[] = []
+
+  constructor(size: number) {
+    this.free = Array.from({ length: size }, (_, i) => i)
+  }
+
+  acquire(): Promise<number> {
+    const slot = this.free.shift()
+    if (slot !== undefined) return Promise.resolve(slot)
+    return new Promise((resolve) => this.waiting.push(resolve))
+  }
+
+  release(slot: number): void {
+    const next = this.waiting.shift()
+    if (next) next(slot)
+    else this.free.push(slot)
+  }
+
+  get available(): number {
+    return this.free.length
+  }
+}
+
+const slots = new SlotPool(MAX_PARALLEL_AGENTS)
+
 /** Preview sandboxes, kept alive for the life of the process. */
 const previews = new Map<string, Preview>()
 
 export function getPreview(projectId: string): Preview | undefined {
   return previews.get(projectId)
+}
+
+/** True when this process holds a live preview for the project. */
+export function hasLivePreview(projectId: string): boolean {
+  return previews.has(projectId)
+}
+
+/** Guards against two concurrent restarts of the same project's preview. */
+const restarting = new Map<string, Promise<Preview | null>>()
+
+/**
+ * Bring a project's preview back up — after the sandbox expired, or after the
+ * orchestrator restarted. Reattaches if the VM is still alive, boots a new one
+ * otherwise.
+ */
+export function restartPreview(projectId: string): Promise<Preview | null> {
+  const existing = restarting.get(projectId)
+  if (existing) return existing
+
+  const task = (async () => {
+    const project = getProject(projectId)
+    if (!project) throw new Error(`no such project: ${projectId}`)
+
+    previews.get(projectId)?.stop().catch(() => {})
+    previews.delete(projectId)
+    publish(projectId, null, 'log', { message: 'restarting preview…' })
+
+    try {
+      const preview = await Preview.resume(project.sandboxId, project.repoPath, (line) =>
+        publish(projectId, null, 'log', { message: line })
+      )
+      previews.set(projectId, preview)
+      const url = `https://${preview.url}`
+      updateProject(projectId, { previewUrl: url, sandboxId: preview.sandboxId })
+      publish(projectId, null, 'preview_ready', { url })
+      return preview
+    } catch (err: any) {
+      publish(projectId, null, 'log', { message: `preview restart failed: ${err.message}` })
+      publish(projectId, null, 'preview_failed', { error: err.message })
+      return null
+    } finally {
+      restarting.delete(projectId)
+    }
+  })()
+
+  restarting.set(projectId, task)
+  return task
+}
+
+/**
+ * Nothing in flight survives a restart: agent state lives in memory and sandboxes
+ * die with the process. Reconcile the database against that reality on boot, so
+ * the board shows the truth instead of work that stopped hours ago.
+ */
+export function reconcileOnBoot(): { previews: number; issues: number } {
+  let previews = 0
+  let issues = 0
+
+  for (const project of listProjects()) {
+    if (project.previewUrl) {
+      updateProject(project.id, { previewUrl: null })
+      previews++
+    }
+    for (const issue of listIssues(project.id)) {
+      if (issue.status === 'running' || issue.status === 'merging') {
+        updateIssue(issue.id, {
+          status: 'failed',
+          error: 'orchestrator restarted while this issue was in progress',
+        })
+        issues++
+      }
+    }
+  }
+
+  return { previews, issues }
 }
 
 export async function shutdownPreviews(): Promise<void> {
@@ -104,24 +215,40 @@ export async function executeWaves(projectId: string, preview: Preview | null): 
 
     publish(projectId, null, 'wave_start', { wave, count: issues.length })
 
-    for (let i = 0; i < issues.length; i += MAX_PARALLEL_AGENTS) {
-      const batch = issues.slice(i, i + MAX_PARALLEL_AGENTS)
-      await Promise.all(batch.map((issue, slot) => workIssue(projectId, issue, slot, preview)))
-    }
+    // Start them all; the slot pool throttles to MAX_PARALLEL_AGENTS and hands
+    // each agent a free panel as one becomes available.
+    await Promise.all(issues.map((issue) => workIssue(projectId, issue, preview)))
 
     publish(projectId, null, 'wave_end', { wave })
   }
 }
 
-/** One issue: run the agent, then hand its patch to the merge queue. */
+/**
+ * One issue: take an agent slot, run the agent, hand its patch to the merge
+ * queue. Waits if all slots are busy, so this is also the concurrency limit.
+ */
 async function workIssue(
+  projectId: string,
+  issue: Issue,
+  preview: Preview | null
+): Promise<void> {
+  const slot = await slots.acquire()
+  try {
+    await workIssueInSlot(projectId, issue, slot, preview)
+  } finally {
+    slots.release(slot)
+  }
+}
+
+async function workIssueInSlot(
   projectId: string,
   issue: Issue,
   slot: number,
   preview: Preview | null
 ): Promise<void> {
   const project = getProject(projectId)!
-  updateIssue(issue.id, { status: 'running', agentSlot: slot })
+  // Clear any error from a previous attempt — this is a fresh run.
+  updateIssue(issue.id, { status: 'running', agentSlot: slot, error: null })
   publish(projectId, issue.id, 'issue_status', { status: 'running', agentSlot: slot })
 
   const conventions = readFileSync(join(TEMPLATE, 'AGENTS.md'), 'utf8')
@@ -256,5 +383,9 @@ async function mergeOne(
 export async function runSingleIssue(projectId: string, issueId: string): Promise<void> {
   const issue = listIssues(projectId).find((i) => i.id === issueId)
   if (!issue) throw new Error(`no such issue: ${issueId}`)
-  await workIssue(projectId, issue, 0, getPreview(projectId) ?? null)
+
+  // No preview yet (expired, or the orchestrator restarted)? Bring one up —
+  // it is what verifies the merge, so without it nothing can land.
+  const preview = getPreview(projectId) ?? (await restartPreview(projectId))
+  await workIssue(projectId, issue, preview)
 }

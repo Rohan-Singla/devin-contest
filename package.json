@@ -3,12 +3,13 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
-  "description": "An autonomous coding agent that works on a real codebase inside an E2B sandbox.",
+  "description": "Autonomous agents that plan, build and modify codebases in parallel.",
   "scripts": {
     "dev": "bun run scripts/dev.ts",
     "server": "bun run src/server.ts",
     "web": "bun --cwd web run dev",
     "smoke": "bun run scripts/smoke.ts",
+    "status": "bun run scripts/status.ts",
     "test": "bun test src/",
     "typecheck": "tsc --noEmit"
   },

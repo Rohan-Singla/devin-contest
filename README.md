@@ -35,10 +35,12 @@ It also works on repositories that already exist: file an issue, an agent picks 
 bun install
 cp .env.example .env      # DEEPSEEK_API_KEY and E2B_API_KEY
 bun run smoke             # verify every external boundary before spending tokens
-bun run dev               # orchestrator on :4000, dashboard on :5000
+bun run dev               # orchestrator on :4000, dashboard on :3000
 ```
 
-Open <http://localhost:5000> and describe an app.
+Open <http://localhost:3000> and describe an app.
+
+> On macOS, port 5000 is taken by AirPlay Receiver, which is why the dashboard uses 3000.
 
 ## How the parallelism actually works
 
@@ -77,19 +79,19 @@ Red tests mean the merge is reverted and the issue is marked failed. Nothing lan
 
 ## Layout
 
-```
-src/
-  orchestrator/
-    planner.ts      prompt → dependency-ordered issues with disjoint paths
-    dispatcher.ts   waves, parallel agents, the serial merge queue
-    worker.ts       one agent, one issue — Pi driving an E2B sandbox
-    preview.ts      the live app, and the verifier the merge queue trusts
-  worker/e2b-ops.ts Pi's tool operations, implemented against E2B
-  platform/         db, git, event bus
-  server.ts         Hono API + WebSocket
-templates/base/     the app skeleton every project starts from
-web/                Next.js dashboard
-```
+Six files carry the whole system:
+
+| File | Responsibility |
+|---|---|
+| `src/orchestrator/planner.ts` | prompt → issues that own disjoint files, grouped into waves |
+| `src/orchestrator/worker.ts` | one agent, one issue — Pi driving an E2B sandbox |
+| `src/worker/e2b-ops.ts` | Pi's tools rewired to run inside the sandbox |
+| `src/orchestrator/dispatcher.ts` | waves, the agent slot pool, the serial merge queue |
+| `src/orchestrator/preview.ts` | the live app, and the verifier the merge queue trusts |
+| `templates/base/AGENTS.md` | the conventions that stop agents colliding |
+
+Supporting cast: `platform/` (sqlite, git, event bus), `server.ts` (Hono + WebSocket),
+`llm.ts` (DeepSeek client, planner only), `sandbox.ts` (E2B wrapper), `web/` (Next.js dashboard).
 
 ## Working on an existing codebase
 
@@ -107,14 +109,17 @@ catalog, product detail page, and a shopping cart."*:
 - Live preview served the built store, `GET /api/products` returning real seeded data
 
 ```bash
-bun test         # tool + parser unit tests, offline
-bun run smoke    # every external boundary
+bun run smoke      # every external boundary, ~40s — run this before a demo
+bun test           # unit tests, offline
 bunx tsc --noEmit
+bun run status <projectId>   # inspect a run from the terminal
 ```
 
 ## Known gaps
 
-- A crash loses in-flight runs — agent state lives in memory. BullMQ + Redis is the fix.
-- Failed issues are not retried; a conflicting issue is marked failed rather than re-run against the
-  updated `main`.
+- A crash loses in-flight runs — agent state lives in memory. On boot the orchestrator reconciles
+  the database against that reality, but the work itself is gone. BullMQ + Redis is the fix.
+- Failed issues are not retried automatically; re-run them from the board.
+- Hand-filed issues declare no owned paths, so they bypass planner conflict-avoidance. The merge
+  queue still catches collisions — the issue fails rather than corrupting `main`.
 - No auth, single user, one process.

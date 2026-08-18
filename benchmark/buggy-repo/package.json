@@ -1,9 +1,0 @@
-{
-  "name": "buggy-cart",
-  "version": "1.0.0",
-  "type": "module",
-  "description": "A small shopping-cart library. Something in here is not right.",
-  "scripts": {
-    "test": "node --test test/*.test.js"
-  }
-}

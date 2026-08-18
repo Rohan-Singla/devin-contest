@@ -34,6 +34,12 @@ export const api = {
       method: 'POST',
     }),
 
+  /** Kicks off a preview boot; the URL arrives later as a `preview_ready` event. */
+  restartPreview: (projectId: string) =>
+    request<{ starting: boolean }>(`/api/projects/${projectId}/preview/restart`, {
+      method: 'POST',
+    }),
+
   commits: (projectId: string) =>
     request<{ hash: string; message: string; date: string }[]>(`/api/projects/${projectId}/commits`),
 }

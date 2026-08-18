@@ -74,7 +74,6 @@ export async function planProject(prompt: string): Promise<Plan> {
   const client = makeClient()
   const response = await complete(client, {
     model: MODELS.pro,
-    tools: false,
     json: true,
     reasoningEffort: 'medium',
     // A 6-issue plan with real specs runs long; truncation here is a hard failure,

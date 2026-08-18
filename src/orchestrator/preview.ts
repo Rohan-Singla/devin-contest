@@ -29,6 +29,34 @@ export class Preview {
     return this.sbx.sandboxId
   }
 
+  /**
+   * Reattach to a project's preview, or build a new one.
+   *
+   * E2B sandboxes expire (and die with the orchestrator), so a `previewUrl`
+   * stored earlier is often pointing at nothing. Reconnecting is far cheaper
+   * than a cold boot when the VM happens to still be alive, so try that first.
+   */
+  static async resume(
+    sandboxId: string | null,
+    repoPath: string,
+    onLog: (line: string) => void
+  ): Promise<Preview> {
+    if (sandboxId) {
+      try {
+        const sbx = await Sandbox.connect(sandboxId)
+        const preview = new Preview(sbx, sbx.getHost(WEB_PORT))
+        onLog(`reattached to sandbox ${sandboxId}`)
+        // The VM survived, but the dev servers may not have.
+        await preview.sync(repoPath)
+        await preview.startServers(onLog)
+        return preview
+      } catch {
+        onLog(`sandbox ${sandboxId} is gone — starting a fresh one`)
+      }
+    }
+    return Preview.start(repoPath, onLog)
+  }
+
   /** Boot a preview: upload the repo, install once, start both dev servers. */
   static async start(repoPath: string, onLog: (line: string) => void): Promise<Preview> {
     const sbx = await Sandbox.create({ timeoutMs: 60 * 60_000 })

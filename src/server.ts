@@ -19,7 +19,15 @@ import {
 } from './platform/db'
 import { publish, subscribe } from './platform/bus'
 import { log as gitLog } from './platform/git'
-import { getPreview, runProject, runSingleIssue, shutdownPreviews } from './orchestrator/dispatcher'
+import {
+  getPreview,
+  hasLivePreview,
+  reconcileOnBoot,
+  restartPreview,
+  runProject,
+  runSingleIssue,
+  shutdownPreviews,
+} from './orchestrator/dispatcher'
 
 const PORT = Number(process.env.PORT ?? 4000)
 const app = new Hono()
@@ -49,7 +57,8 @@ app.get('/api/projects/:id', (c) => {
   const project = getProject(c.req.param('id'))
   if (!project) return c.json({ error: 'not found' }, 404)
   return c.json({
-    project,
+    // A stored previewUrl is only meaningful while this process holds the sandbox.
+    project: { ...project, previewLive: hasLivePreview(project.id) },
     issues: listIssues(project.id),
     events: listEvents(project.id),
   })
@@ -108,7 +117,23 @@ app.post('/api/projects/:id/issues/:issueId/run', async (c) => {
 
 app.get('/api/projects/:id/preview', (c) => {
   const preview = getPreview(c.req.param('id'))
-  return c.json({ url: preview ? `https://${preview.url}` : null })
+  return c.json({ url: preview ? `https://${preview.url}` : null, live: !!preview })
+})
+
+/**
+ * Bring a dead preview back — sandboxes expire and die with the process.
+ *
+ * Booting one takes ~90s, far longer than any sensible HTTP timeout, so this
+ * returns immediately and the URL arrives over the socket as `preview_ready`.
+ */
+app.post('/api/projects/:id/preview/restart', (c) => {
+  const project = getProject(c.req.param('id'))
+  if (!project) return c.json({ error: 'not found' }, 404)
+
+  restartPreview(project.id).catch((err) => {
+    publish(project.id, null, 'preview_failed', { error: err.message })
+  })
+  return c.json({ starting: true }, 202)
 })
 
 app.get('/api/health', (c) => c.json({ ok: true }))
@@ -146,6 +171,8 @@ const websocket: WebSocketHandler<SocketData> = {
 
 const server = Bun.serve({
   port: PORT,
+  // Agent and sandbox work is slow; the default 10s closes connections mid-flight.
+  idleTimeout: 120,
   fetch(req, srv) {
     const url = new URL(req.url)
     if (url.pathname === '/ws') {
@@ -159,6 +186,14 @@ const server = Bun.serve({
   },
   websocket,
 })
+
+// Sandboxes and agent runs never outlive the process; make the DB agree.
+const reconciled = reconcileOnBoot()
+if (reconciled.previews || reconciled.issues) {
+  console.log(
+    `  reconciled ${reconciled.previews} stale preview(s), ${reconciled.issues} interrupted issue(s)`
+  )
+}
 
 console.log(`\n  mini-devin server → http://localhost:${server.port}`)
 console.log(`  websocket         → ws://localhost:${server.port}/ws?project=<id>\n`)

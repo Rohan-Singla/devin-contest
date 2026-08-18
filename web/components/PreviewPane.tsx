@@ -1,12 +1,36 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import type { ProjectStatus } from '@/lib/types'
 
-export function PreviewPane({ url, status }: { url: string | null; status: ProjectStatus }) {
+export function PreviewPane({
+  url,
+  status,
+  onRestart,
+}: {
+  url: string | null
+  status: ProjectStatus
+  onRestart: () => Promise<void>
+}) {
   // Bumping this remounts the iframe — how freshly merged work becomes visible.
   const [nonce, setNonce] = useState(0)
+  const [restarting, setRestarting] = useState(false)
+
+  // The boot is asynchronous: the request returns at once and the URL arrives
+  // over the socket, so the spinner clears on the URL, not on the response.
+  useEffect(() => {
+    if (url) setRestarting(false)
+  }, [url])
+
+  async function restart() {
+    setRestarting(true)
+    try {
+      await onRestart()
+    } catch {
+      setRestarting(false)
+    }
+  }
 
   return (
     <section className="flex flex-col overflow-hidden border-l">
@@ -46,8 +70,25 @@ export function PreviewPane({ url, status }: { url: string | null; status: Proje
             sandbox="allow-scripts allow-same-origin allow-forms"
           />
         ) : (
-          <div className="flex size-full items-center justify-center bg-background text-muted-foreground">
-            {status === 'failed' ? 'Preview unavailable' : 'Booting the preview sandbox…'}
+          <div className="flex size-full flex-col items-center justify-center gap-3 bg-background px-6 text-center text-muted-foreground">
+            {status === 'planning' || status === 'building' ? (
+              <p>Booting the preview sandbox…</p>
+            ) : (
+              <>
+                <p className="max-w-xs leading-relaxed">
+                  The preview sandbox has stopped. Sandboxes expire after an hour and shut down
+                  with the orchestrator — the code is safe in the project repository.
+                </p>
+                <Button size="sm" onClick={restart} disabled={restarting}>
+                  {restarting ? 'Starting sandbox…' : 'Restart preview'}
+                </Button>
+                {restarting && (
+                  <p className="text-[11px]">
+                    Booting a VM and installing dependencies — about 90 seconds.
+                  </p>
+                )}
+              </>
+            )}
           </div>
         )}
       </div>

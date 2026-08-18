@@ -1,6 +1,9 @@
 /**
- * DeepSeek client. The API is OpenAI-compatible, so we drive it with the
- * official OpenAI SDK pointed at DeepSeek's base URL.
+ * DeepSeek client, used by the planner.
+ *
+ * Agents do not go through here — they run on Pi, which has its own provider
+ * layer. This is only for the one-shot structured calls the orchestrator makes.
+ * The API is OpenAI-compatible, so the official OpenAI SDK drives it.
  */
 import OpenAI from 'openai'
 import type {
@@ -8,7 +11,6 @@ import type {
   ChatCompletionCreateParamsNonStreaming,
   ChatCompletionMessageParam,
 } from 'openai/resources/chat/completions'
-import { TOOL_SPECS } from './tools'
 
 export const MODELS = {
   pro: 'deepseek-v4-pro',
@@ -25,15 +27,9 @@ export function makeClient(): OpenAI {
   return new OpenAI({ apiKey, baseURL: 'https://api.deepseek.com' })
 }
 
-/** Rough token estimate — good enough to decide when to compact. */
-export function estimateTokens(messages: ChatCompletionMessageParam[]): number {
-  return Math.ceil(JSON.stringify(messages).length / 3.6)
-}
-
 export interface CompleteOpts {
   model: ModelName
   messages: ChatCompletionMessageParam[]
-  tools?: boolean
   reasoningEffort?: 'low' | 'medium' | 'high'
   maxTokens?: number
   /** Constrain the reply to a single JSON object. */
@@ -43,22 +39,13 @@ export interface CompleteOpts {
 /** One model call, with bounded retries on transient failures. */
 export async function complete(
   client: OpenAI,
-  {
-    model,
-    messages,
-    tools = true,
-    reasoningEffort = 'medium',
-    maxTokens = 8000,
-    json = false,
-  }: CompleteOpts
+  { model, messages, reasoningEffort = 'medium', maxTokens = 8000, json = false }: CompleteOpts
 ): Promise<ChatCompletion> {
   const params: ChatCompletionCreateParamsNonStreaming = {
     model,
     messages,
     max_tokens: maxTokens,
-    ...(tools ? { tools: TOOL_SPECS, tool_choice: 'auto' as const } : {}),
     ...(json ? { response_format: { type: 'json_object' as const } } : {}),
-    // DeepSeek V4 supports tool use with thinking enabled.
     reasoning_effort: reasoningEffort,
   }
 
@@ -75,9 +62,4 @@ export async function complete(
     }
   }
   throw lastErr
-}
-
-/** DeepSeek returns chain-of-thought on a non-standard field. */
-export function reasoningOf(message: ChatCompletion.Choice['message']): string {
-  return (message as { reasoning_content?: string }).reasoning_content ?? ''
 }

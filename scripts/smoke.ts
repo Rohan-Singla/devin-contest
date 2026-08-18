@@ -1,155 +1,136 @@
 #!/usr/bin/env bun
 /**
- * Pre-flight check. Exercises every network boundary once, cheaply, so a
- * failure points at one thing instead of at "the agent didn't work".
+ * Pre-flight check. Exercises every external boundary once, cheaply, so a
+ * failure names one thing instead of "the build didn't work".
  *
- *   bun run smoke
+ * Run this before a demo.
  */
-import { AgentSandbox, WORKDIR } from '../src/sandbox'
-import { complete, makeClient, MODELS, reasoningOf } from '../src/llm'
-import { runTool, type ToolContext } from '../src/tools'
+import { ModelRuntime } from '@earendil-works/pi-coding-agent'
+import { rmSync } from 'node:fs'
+import { complete, makeClient, MODELS } from '../src/llm'
+import { AgentSandbox } from '../src/sandbox'
+import { bashOps, lsOps, readOps } from '../src/worker/e2b-ops'
+import { initRepo, trackedFiles } from '../src/platform/git'
+import { deconflict } from '../src/orchestrator/planner'
 
 const ok = (s: string) => console.log(`\x1b[32m  ✓\x1b[0m ${s}`)
 const bad = (s: string) => console.log(`\x1b[31m  ✗\x1b[0m ${s}`)
 const step = (s: string) => console.log(`\n\x1b[1m▌ ${s}\x1b[0m`)
 
 let failures = 0
-function check(cond: boolean, pass: string, fail: string) {
+const check = (cond: boolean, pass: string, fail: string) =>
   cond ? ok(pass) : (failures++, bad(fail))
-}
 
-// ─────────────────────────────────────────── 1. DeepSeek: plain completion
-step('DeepSeek — basic completion')
-const client = makeClient()
+// ───────────────────────────────────────────── 1. planner model
+step('DeepSeek — the planner\'s model')
 try {
-  const res = await complete(client, {
+  const res = await complete(makeClient(), {
     model: MODELS.flash,
-    tools: false,
     maxTokens: 64,
     messages: [{ role: 'user', content: 'Reply with exactly: PONG' }],
   })
   const text = res.choices[0]?.message.content ?? ''
-  check(text.includes('PONG'), `model replied (${res.usage?.total_tokens} tok)`, `unexpected reply: ${text}`)
+  check(text.includes('PONG'), `reachable (${res.usage?.total_tokens} tok)`, `odd reply: ${text}`)
 } catch (err: any) {
   failures++
   bad(`request failed: ${err?.status ?? ''} ${err?.message}`)
 }
 
-// ─────────────────────────────────────────── 2. DeepSeek: tool calling
-step('DeepSeek — tool calling (the shape the agent depends on)')
+// ───────────────────────────────────────────── 2. Pi's model runtime
+step('Pi — agent runtime and model resolution')
 try {
-  const res = await complete(client, {
-    model: MODELS.pro,
-    maxTokens: 512,
-    messages: [
-      { role: 'system', content: 'You are testing tools. Use them immediately, without preamble.' },
-      { role: 'user', content: 'Read the file src/cart.js and nothing else.' },
-    ],
-  })
-  const msg = res.choices[0]!.message
-  const calls = msg.tool_calls ?? []
-  check(calls.length > 0, `returned ${calls.length} tool_call(s)`, 'returned NO tool_calls — the agent loop cannot work')
-
-  if (calls[0]) {
-    const c = calls[0]
-    check(c.type === 'function', `type is "function"`, `unexpected call type: ${c.type}`)
-    check(typeof c.id === 'string' && c.id.length > 0, `call id present (${c.id})`, 'missing tool_call id')
-    const fn = (c as any).function
-    check(fn?.name === 'read_file', `called read_file`, `called "${fn?.name}" instead of read_file`)
-    try {
-      const args = JSON.parse(fn.arguments)
-      check(typeof args.path === 'string', `arguments parse as JSON (path=${args.path})`, 'arguments missing "path"')
-    } catch {
-      failures++
-      bad(`arguments were not valid JSON: ${fn?.arguments?.slice(0, 120)}`)
-    }
-  }
-  check(reasoningOf(msg) !== undefined, 'reasoning field readable', 'reasoning field unreadable')
-
-  // The round trip: send a tool result back and confirm the API accepts it.
-  const followUp = await complete(client, {
-    model: MODELS.pro,
-    maxTokens: 256,
-    messages: [
-      { role: 'system', content: 'You are testing tools.' },
-      { role: 'user', content: 'Read the file src/cart.js and nothing else.' },
-      { role: 'assistant', content: msg.content ?? '', tool_calls: msg.tool_calls },
-      ...calls.map((c) => ({
-        role: 'tool' as const,
-        tool_call_id: c.id,
-        content: 'export const x = 1',
-      })),
-    ],
-  })
-  check(!!followUp.choices[0], 'tool results accepted on the round trip', 'round trip rejected')
+  const runtime = await ModelRuntime.create()
+  const model = runtime.getModel('deepseek', MODELS.pro)
+  check(!!model, `pi resolves ${MODELS.pro}`, `pi cannot resolve ${MODELS.pro}`)
+  const auth = await runtime.checkAuth('deepseek').catch(() => undefined)
+  check(auth !== undefined, 'deepseek credentials visible to pi', 'pi sees no deepseek credentials')
 } catch (err: any) {
   failures++
-  bad(`tool calling failed: ${err?.status ?? ''} ${err?.message}`)
+  bad(`pi runtime failed: ${err?.message}`)
 }
 
-// ─────────────────────────────────────────── 3. E2B sandbox
-step('E2B — sandbox lifecycle')
+// ───────────────────────────────────────────── 3. planner logic (offline)
+step('Planner — conflict resolution')
+{
+  const planned = deconflict([
+    { title: 'a', body: '', wave: 0, paths: ['server/routes/x.js'], dependencies: [] },
+    { title: 'b', body: '', wave: 0, paths: ['server/routes/x.js'], dependencies: [] },
+  ])
+  check(
+    planned[0]!.wave !== planned[1]!.wave,
+    'issues claiming the same file are split across waves',
+    'two issues in one wave still claim the same file'
+  )
+
+  const guarded = deconflict([
+    { title: 'c', body: '', wave: 0, paths: ['server/index.js'], dependencies: [] },
+  ])
+  check(
+    guarded[0]!.paths.length === 0,
+    'shared files are stripped from issue ownership',
+    'an issue was allowed to own server/index.js'
+  )
+}
+
+// ───────────────────────────────────────────── 4. repo scaffolding
+step('Git — project scaffolding')
+const repoPath = 'data/smoke-repo'
+try {
+  rmSync(repoPath, { recursive: true, force: true })
+  await initRepo(repoPath, 'templates/base')
+  const files = await trackedFiles(repoPath)
+  check(files.length > 5, `template committed (${files.length} files)`, 'template did not commit')
+  check(
+    files.some((f) => f.path === 'AGENTS.md'),
+    'conventions file present',
+    'AGENTS.md missing — agents will not know the rules'
+  )
+} catch (err: any) {
+  failures++
+  bad(`scaffolding failed: ${err?.message}`)
+}
+
+// ───────────────────────────────────────────── 5. sandbox + Pi's tool ops
+step('E2B — sandbox and the operations backing Pi\'s tools')
 let sandbox: AgentSandbox | null = null
 try {
-  sandbox = await AgentSandbox.create('./benchmark/buggy-repo')
+  sandbox = await AgentSandbox.create(repoPath)
   ok(`sandbox created (${sandbox.id})`)
 
-  const ls = await sandbox.exec('ls')
-  check(ls.stdout.includes('package.json'), 'repo uploaded and visible', `upload looks wrong: ${ls.stdout}`)
-
   const node = await sandbox.exec('node --version')
-  check(node.exitCode === 0, `node present (${node.stdout.trim()})`, 'node missing in sandbox template')
+  check(node.exitCode === 0, `node present (${node.stdout.trim()})`, 'node missing in template')
 
-  const major = Number(node.stdout.trim().replace(/^v/, '').split('.')[0])
-  check(major >= 18, `node ${major} supports --test`, `node ${major} is too old for the benchmark's test runner`)
-
-  const tests = await sandbox.exec('npm test')
-  check(
-    tests.exitCode !== 0,
-    'benchmark suite fails as expected (bugs are present)',
-    'benchmark suite PASSES before any fix — the planted bugs are missing'
-  )
-
-  const failCount = (tests.stdout + tests.stderr).match(/# fail (\d+)/)?.[1]
-  check(failCount === '4', `4 failing tests, as designed`, `expected 4 failing tests, saw ${failCount ?? 'unknown'}`)
-
-  // Non-zero exits must be captured, not thrown — the agent needs to read them.
   const failing = await sandbox.exec('exit 3')
-  check(failing.exitCode === 3, 'non-zero exit codes are captured, not thrown', `exit code lost: ${failing.exitCode}`)
+  check(failing.exitCode === 3, 'non-zero exits captured, not thrown', `exit code lost: ${failing.exitCode}`)
 
-  step('Tool handlers — against the real sandbox')
-  const ctx: ToolContext = { sandbox }
-  const read = await runTool('read_file', JSON.stringify({ path: 'src/cart.js' }), ctx)
-  check(read.ok && read.output.includes('subtotal'), 'read_file works', `read_file failed: ${read.output.slice(0, 120)}`)
+  // The three operation sets Pi's read / ls / bash tools run through.
+  const contents = await readOps(sandbox).readFile('/home/user/repo/package.json')
+  check(contents.toString().includes('generated-app'), 'read operations work', 'read operations failed')
 
-  const found = await runTool('search', JSON.stringify({ pattern: 'paginate' }), ctx)
-  check(found.ok && found.output.includes('cart.js'), 'search works', `search failed: ${found.output.slice(0, 120)}`)
+  const entries = await lsOps(sandbox).readdir('/home/user/repo/server')
+  check(entries.includes('index.js'), 'ls operations work', `ls operations failed: ${entries}`)
 
-  const listed = await runTool('list_files', '{}', ctx)
-  check(listed.output.includes('src/cart.js'), 'list_files works', `list_files failed: ${listed.output.slice(0, 120)}`)
-
-  const edited = await runTool(
-    'edit_file',
-    JSON.stringify({ path: 'src/cart.js', old_string: 'const FREE_SHIPPING_THRESHOLD = 50', new_string: 'const FREE_SHIPPING_THRESHOLD = 51' }),
-    ctx
+  let streamed = ''
+  const result = await bashOps(sandbox).exec('echo hello-from-sandbox', '/home/user/repo', {
+    onData: (chunk) => (streamed += chunk.toString()),
+  })
+  check(
+    result.exitCode === 0 && streamed.includes('hello-from-sandbox'),
+    'bash operations stream output',
+    `bash operations failed: ${streamed}`
   )
-  check(edited.ok, 'edit_file works', `edit_file failed: ${edited.output.slice(0, 120)}`)
-
-  const diff = await sandbox.exec('git init -q 2>/dev/null; git -c user.email=a@b -c user.name=t add -A && git diff --cached --stat')
-  check(diff.stdout.includes('cart.js'), 'git diff captures agent changes', 'diff did not see the edit')
 } catch (err: any) {
   failures++
   bad(`sandbox failed: ${err?.message}`)
 } finally {
-  if (sandbox) {
-    await sandbox.kill()
-    ok('sandbox destroyed')
-  }
+  await sandbox?.kill().catch(() => {})
+  rmSync(repoPath, { recursive: true, force: true })
+  ok('cleaned up')
 }
 
 console.log(
   failures === 0
-    ? `\n\x1b[32m\x1b[1m▌ ALL CLEAR\x1b[0m — run \x1b[1mbun run demo\x1b[0m\n`
-    : `\n\x1b[31m\x1b[1m▌ ${failures} CHECK(S) FAILED\x1b[0m — fix these before the full run\n`
+    ? `\n\x1b[32m\x1b[1m▌ ALL CLEAR\x1b[0m — run \x1b[1mbun run dev\x1b[0m\n`
+    : `\n\x1b[31m\x1b[1m▌ ${failures} CHECK(S) FAILED\x1b[0m\n`
 )
 process.exit(failures === 0 ? 0 : 1)

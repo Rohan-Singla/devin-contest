@@ -7,6 +7,8 @@ export interface Project {
   prompt: string
   status: ProjectStatus
   previewUrl: string | null
+  /** Whether the orchestrator currently holds a live sandbox for this project. */
+  previewLive?: boolean
   error: string | null
   createdAt: number
 }
